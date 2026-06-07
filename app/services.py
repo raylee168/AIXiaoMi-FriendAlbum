@@ -696,6 +696,63 @@ def push_results(db: Session, limit: int = 20) -> dict:
     return {"scanned": len(tasks), "processed": processed, "failed": failed}
 
 
+def _cleanup_path(item: str) -> tuple[int, int]:
+    path = Path(item)
+    if not path.exists():
+        return 0, 0
+    try:
+        if path.is_dir():
+            cleaned = 0
+            for child in sorted(path.rglob("*"), reverse=True):
+                if child.is_file():
+                    child.unlink(missing_ok=True)
+                    cleaned += 1
+                elif child.is_dir():
+                    try:
+                        child.rmdir()
+                    except OSError:
+                        pass
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+            return cleaned, 0
+        path.unlink()
+        return 1, 0
+    except Exception:
+        return 0, 1
+
+
+def _cleanup_expired_photos(db: Session, now: datetime, limit: int) -> dict:
+    photos = list(
+        db.scalars(
+            select(PhotoFile)
+            .where(PhotoFile.cleanup_status != "cleaned", PhotoFile.expire_at <= now)
+            .order_by(PhotoFile.expire_at)
+            .limit(limit)
+        )
+    )
+    processed = 0
+    failed = 0
+    files_cleaned = 0
+    for photo in photos:
+        cleaned = 0
+        failed_count = 0
+        for item in {photo.original_path, photo.compressed_path, photo.thumbnail_path}:
+            item_cleaned, item_failed = _cleanup_path(item)
+            cleaned += item_cleaned
+            failed_count += item_failed
+        files_cleaned += cleaned
+        if failed_count:
+            photo.cleanup_status = "failed"
+            failed += 1
+        else:
+            photo.cleanup_status = "cleaned"
+            photo.cleaned_at = datetime.utcnow()
+            processed += 1
+    return {"scanned": len(photos), "processed": processed, "failed": failed, "files_cleaned": files_cleaned}
+
+
 def cleanup_files(db: Session, limit: int = 50) -> dict:
     started = datetime.utcnow()
     now = datetime.utcnow()
@@ -709,32 +766,34 @@ def cleanup_files(db: Session, limit: int = 50) -> dict:
     )
     processed = 0
     failed = 0
+    task_files_cleaned = 0
     for task in tasks:
         cleaned = 0
         failed_count = 0
         for item in task.cleanup_scope_json.get("paths", []):
-            path = Path(item)
-            try:
-                if path.is_dir():
-                    for child in sorted(path.rglob("*"), reverse=True):
-                        if child.is_file():
-                            child.unlink(missing_ok=True)
-                    path.rmdir()
-                    cleaned += 1
-                elif path.exists():
-                    path.unlink()
-                    cleaned += 1
-            except Exception:
-                failed_count += 1
+            item_cleaned, item_failed = _cleanup_path(item)
+            cleaned += item_cleaned
+            failed_count += item_failed
         task.cleaned_file_count = cleaned
         task.failed_file_count = failed_count
         task.status = "success" if failed_count == 0 else "failed"
         task.cleaned_at = datetime.utcnow()
+        task_files_cleaned += cleaned
         processed += int(failed_count == 0)
         failed += int(failed_count > 0)
+    photo_cleanup = _cleanup_expired_photos(db, now, limit)
     db.commit()
-    _log(db, "cleanup", started, len(tasks), processed, failed)
-    return {"scanned": len(tasks), "processed": processed, "failed": failed}
+    scanned = len(tasks) + photo_cleanup["scanned"]
+    total_processed = processed + photo_cleanup["processed"]
+    total_failed = failed + photo_cleanup["failed"]
+    _log(db, "cleanup", started, scanned, total_processed, total_failed)
+    return {
+        "scanned": scanned,
+        "processed": total_processed,
+        "failed": total_failed,
+        "cleanup_tasks": {"scanned": len(tasks), "processed": processed, "failed": failed, "files_cleaned": task_files_cleaned},
+        "expired_photos": photo_cleanup,
+    }
 
 
 def apply_photo_rejects(db: Session, payload: PhotoRejectApply) -> dict:

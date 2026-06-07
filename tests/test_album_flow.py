@@ -153,6 +153,51 @@ def test_photo_reject_updates_only_specified_photos():
     db.close()
 
 
+def test_cleanup_removes_expired_upload_files_but_keeps_metadata():
+    db = SessionLocal()
+    now = datetime.utcnow()
+    base = Path(storage_root) / "uploads" / "u_cleanup" / "batch_cleanup"
+    original = base / "original" / "expired.jpg"
+    compressed = base / "compressed" / "expired.jpg"
+    thumb = base / "thumbnails" / "expired.jpg"
+    for path in [original, compressed, thumb]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (20, 20), (120, 120, 120)).save(path)
+    db.add(
+        PhotoFile(
+            photo_id="expired_photo",
+            user_id="u_cleanup",
+            upload_batch_id="batch_cleanup",
+            original_path=str(original),
+            compressed_path=str(compressed),
+            thumbnail_path=str(thumb),
+            original_filename="expired.jpg",
+            mime_type="image/jpeg",
+            file_size=original.stat().st_size,
+            width=20,
+            height=20,
+            uploaded_at=now - timedelta(hours=4),
+            expire_at=now - timedelta(hours=1),
+            preprocess_status="success",
+            cleanup_status="pending",
+        )
+    )
+    db.commit()
+    db.close()
+
+    cleanup = client.post("/internal/schedulers/cleanup").json()
+    assert cleanup["expired_photos"]["processed"] >= 1
+    assert not original.exists()
+    assert not compressed.exists()
+    assert not thumb.exists()
+
+    db = SessionLocal()
+    photo = db.scalars(select(PhotoFile).where(PhotoFile.photo_id == "expired_photo")).one()
+    assert photo.cleanup_status == "cleaned"
+    assert photo.cleaned_at is not None
+    db.close()
+
+
 def test_push_uses_agent_message_id(monkeypatch):
     monkeypatch.setenv("AGENT_BASE_URL", "http://agent.local")
     monkeypatch.setenv("MOCK_PUSH", "false")
