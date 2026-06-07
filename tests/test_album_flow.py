@@ -10,6 +10,7 @@ os.environ["STORAGE_ROOT"] = storage_root
 os.environ["MOCK_ACCOUNT"] = "true"
 
 from fastapi.testclient import TestClient
+import httpx
 from PIL import Image
 from sqlalchemy import select
 
@@ -17,6 +18,7 @@ from app.db.base import Base
 from app.db.session import SessionLocal, engine
 from app.main import app
 from app.core.config import get_settings
+from app.channel_bridge import set_channel_sender
 from app.models import AlbumCleanupTask, AlbumGenerationResult, AlbumGenerationTask, AlbumPushTask, PhotoFile, PluginEvent
 
 
@@ -198,8 +200,73 @@ def test_cleanup_removes_expired_upload_files_but_keeps_metadata():
     db.close()
 
 
-def test_push_uses_agent_message_id(monkeypatch):
-    monkeypatch.setenv("AGENT_BASE_URL", "http://agent.local")
+def test_decision_skips_when_smart_generation_not_enabled(monkeypatch):
+    monkeypatch.setenv("MOCK_ACCOUNT", "false")
+    monkeypatch.setenv("ACCOUNT_SERVER_BASE_URL", "http://account.local")
+    get_settings.cache_clear()
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"smart_generation_enabled": 0, "auto_charge_agreed": 0}
+
+    def fake_get(self, url):
+        return FakeResponse()
+
+    monkeypatch.setattr(httpx.Client, "get", fake_get)
+
+    db = SessionLocal()
+    now = datetime.utcnow()
+    base = Path(storage_root) / "uploads" / "u_disabled" / "batch_disabled"
+    for folder in ["original", "compressed", "thumbnails"]:
+        (base / folder).mkdir(parents=True, exist_ok=True)
+    for idx in range(6):
+        photo_id = f"disabled_photo_{idx}"
+        original = base / "original" / f"{photo_id}.jpg"
+        compressed = base / "compressed" / f"{photo_id}.jpg"
+        thumb = base / "thumbnails" / f"{photo_id}.jpg"
+        Image.new("RGB", (30, 30), (120, 120, 120)).save(original)
+        Image.new("RGB", (30, 30), (120, 120, 120)).save(compressed)
+        Image.new("RGB", (30, 30), (120, 120, 120)).save(thumb)
+        db.add(
+            PhotoFile(
+                photo_id=photo_id,
+                user_id="u_disabled",
+                upload_batch_id="batch_disabled",
+                original_path=str(original),
+                compressed_path=str(compressed),
+                thumbnail_path=str(thumb),
+                original_filename=f"{photo_id}.jpg",
+                mime_type="image/jpeg",
+                file_size=original.stat().st_size,
+                width=30,
+                height=30,
+                uploaded_at=now,
+                expire_at=now + timedelta(hours=3),
+                preprocess_status="success",
+                cleanup_status="pending",
+            )
+        )
+    db.commit()
+    db.close()
+
+    response = client.post("/internal/schedulers/decision")
+    assert response.status_code == 200
+    assert response.json()["processed"] == 0
+
+    db = SessionLocal()
+    created = list(db.scalars(select(AlbumGenerationTask).where(AlbumGenerationTask.user_id == "u_disabled")))
+    assert created == []
+    db.close()
+    monkeypatch.setenv("MOCK_ACCOUNT", "true")
+    monkeypatch.delenv("ACCOUNT_SERVER_BASE_URL")
+    get_settings.cache_clear()
+
+
+def test_push_uses_cowagent_channel_message_id(monkeypatch):
+    monkeypatch.setenv("COWAGENT_CHANNEL_BASE_URL", "http://cowagent.local")
     monkeypatch.setenv("MOCK_PUSH", "false")
     get_settings.cache_clear()
 
@@ -251,14 +318,159 @@ def test_push_uses_agent_message_id(monkeypatch):
     db.commit()
     db.close()
 
-    monkeypatch.setattr("app.services._send_via_agent", lambda task: "agent_msg_001")
+    monkeypatch.setattr("app.services._send_via_cowagent_channel", lambda task: "cowagent_msg_001")
     response = client.post("/internal/schedulers/push")
     assert response.status_code == 200
 
     db = SessionLocal()
     pushed = db.query(AlbumPushTask).filter(AlbumPushTask.push_task_id == "push_agent").one()
     assert pushed.status == "success"
-    assert pushed.message_id == "agent_msg_001"
+    assert pushed.message_id == "cowagent_msg_001"
     db.close()
+    monkeypatch.setenv("MOCK_PUSH", "true")
+    monkeypatch.delenv("COWAGENT_CHANNEL_BASE_URL")
+    get_settings.cache_clear()
+
+
+def test_push_does_not_resend_when_message_id_exists(monkeypatch):
+    monkeypatch.setenv("COWAGENT_CHANNEL_BASE_URL", "http://cowagent.local")
+    monkeypatch.setenv("MOCK_PUSH", "false")
+    get_settings.cache_clear()
+
+    db = SessionLocal()
+    task_id = "gen_channel_retry"
+    result_id = "result_channel_retry"
+    now = datetime.utcnow()
+    db.add(
+        AlbumGenerationTask(
+            generation_task_id=task_id,
+            user_id="u_channel_retry",
+            decision_job_id="decision_channel_retry",
+            template_id="mvp_grid_001",
+            album_index=1,
+            photo_ids_json=["p_retry"],
+            main_photo_id="p_retry",
+            status="success",
+            result_dir=str(Path(storage_root) / "results" / task_id),
+            account_hold_id="hold_retry",
+            actual_token_cost=12000,
+        )
+    )
+    db.add(
+        AlbumGenerationResult(
+            result_id=result_id,
+            generation_task_id=task_id,
+            user_id="u_channel_retry",
+            album_title="title",
+            copy_text="copy",
+            copy_options_json=[{"style": "daily", "text": "copy"}],
+            image_path=str(Path(storage_root) / "retry.jpg"),
+            thumbnail_path=str(Path(storage_root) / "retry_thumb.jpg"),
+            width=1,
+            height=1,
+            file_size=1,
+            expire_at=now + timedelta(hours=3),
+        )
+    )
+    db.add(
+        AlbumPushTask(
+            push_task_id="push_channel_retry",
+            user_id="u_channel_retry",
+            generation_task_id=task_id,
+            result_id=result_id,
+            push_channel="mock",
+            push_payload_json={"type": "album_result", "text": "copy"},
+            status="pending",
+            message_id="existing_msg_001",
+        )
+    )
+    db.commit()
+    db.close()
+
+    def fail_if_called(task):
+        raise AssertionError("channel should not resend")
+
+    monkeypatch.setattr("app.services._send_via_cowagent_channel", fail_if_called)
+    response = client.post("/internal/schedulers/push")
+    assert response.status_code == 200
+
+    db = SessionLocal()
+    pushed = db.query(AlbumPushTask).filter(AlbumPushTask.push_task_id == "push_channel_retry").one()
+    assert pushed.status == "success"
+    assert pushed.message_id == "existing_msg_001"
+    db.close()
+    monkeypatch.setenv("MOCK_PUSH", "true")
+    monkeypatch.delenv("COWAGENT_CHANNEL_BASE_URL")
+    get_settings.cache_clear()
+
+
+def test_push_uses_injected_cowagent_sender(monkeypatch):
+    monkeypatch.setenv("MOCK_PUSH", "false")
+    get_settings.cache_clear()
+    sent = []
+
+    def sender(payload):
+        sent.append(payload)
+        return "injected_msg_001"
+
+    set_channel_sender(sender)
+    db = SessionLocal()
+    task_id = "gen_injected_channel"
+    result_id = "result_injected_channel"
+    now = datetime.utcnow()
+    db.add(
+        AlbumGenerationTask(
+            generation_task_id=task_id,
+            user_id="u_injected",
+            decision_job_id="decision_injected",
+            template_id="mvp_grid_001",
+            album_index=1,
+            photo_ids_json=["p_injected"],
+            main_photo_id="p_injected",
+            status="success",
+            result_dir=str(Path(storage_root) / "results" / task_id),
+            actual_token_cost=12000,
+        )
+    )
+    db.add(
+        AlbumGenerationResult(
+            result_id=result_id,
+            generation_task_id=task_id,
+            user_id="u_injected",
+            album_title="title",
+            copy_text="copy",
+            copy_options_json=[{"style": "daily", "text": "copy"}],
+            image_path=str(Path(storage_root) / "injected.jpg"),
+            thumbnail_path=str(Path(storage_root) / "injected_thumb.jpg"),
+            width=1,
+            height=1,
+            file_size=1,
+            expire_at=now + timedelta(hours=3),
+        )
+    )
+    db.add(
+        AlbumPushTask(
+            push_task_id="push_injected",
+            user_id="u_injected",
+            generation_task_id=task_id,
+            result_id=result_id,
+            push_channel="mock",
+            push_payload_json={"type": "album_result", "text": "copy"},
+            status="pending",
+        )
+    )
+    db.commit()
+    db.close()
+
+    response = client.post("/internal/schedulers/push")
+    assert response.status_code == 200
+    assert sent and sent[0]["user_id"] == "u_injected"
+
+    db = SessionLocal()
+    pushed = db.query(AlbumPushTask).filter(AlbumPushTask.push_task_id == "push_injected").one()
+    assert pushed.status == "success"
+    assert pushed.message_id == "injected_msg_001"
+    db.close()
+    set_channel_sender(None)
     monkeypatch.setenv("MOCK_PUSH", "true")
     get_settings.cache_clear()

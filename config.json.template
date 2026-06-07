@@ -1,0 +1,10 @@
+{
+  "scheduler_enabled": true,
+  "scan_events_seconds": 10,
+  "preprocess_seconds": 10,
+  "decision_seconds": 60,
+  "generation_seconds": 10,
+  "push_seconds": 10,
+  "cleanup_seconds": 600,
+  "fallback_channel_log_path": "/data/smart-album/logs/moments_album_channel.jsonl"
+}

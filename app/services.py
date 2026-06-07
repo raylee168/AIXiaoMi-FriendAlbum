@@ -8,6 +8,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageStat
 from sqlalchemy import and_, func, select, update
 from sqlalchemy.orm import Session
 
+from app.channel_bridge import get_channel_sender
 from app.core.config import get_settings
 from app.models import (
     AlbumCleanupTask,
@@ -228,6 +229,20 @@ def _summary_for_photos(db: Session, photos: list[PhotoFile]) -> dict:
     }
 
 
+def _smart_generation_allowed(user_id: str) -> bool:
+    settings = get_settings()
+    if settings.mock_account or not settings.account_server_base_url:
+        return True
+    try:
+        with httpx.Client(timeout=10) as client:
+            response = client.get(f"{settings.account_server_base_url}/internal/users/{user_id}/smart-generation-settings")
+            response.raise_for_status()
+            payload = response.json()
+            return bool(payload.get("smart_generation_enabled")) and bool(payload.get("auto_charge_agreed"))
+    except Exception:
+        return False
+
+
 def _local_decision(summary: dict) -> dict:
     return {
         "content": {
@@ -298,6 +313,8 @@ def make_decisions(db: Session) -> dict:
     user_ids = list(db.scalars(select(PhotoFile.user_id).where(PhotoFile.preprocess_status == "success").distinct()))
     processed = 0
     for user_id in user_ids:
+        if not _smart_generation_allowed(user_id):
+            continue
         active = db.scalar(
             select(func.count()).select_from(AlbumGenerationTask).where(
                 AlbumGenerationTask.user_id == user_id,
@@ -622,11 +639,30 @@ def generate_albums(db: Session, limit: int = 10) -> dict:
     return {"scanned": len(tasks), "processed": processed, "failed": failed}
 
 
-def _send_via_agent(task: AlbumPushTask) -> str:
+def _channel_base_url() -> str:
+    settings = get_settings()
+    return settings.cowagent_channel_base_url or settings.agent_base_url
+
+
+def _has_push_channel() -> bool:
+    return bool(get_channel_sender() or _channel_base_url())
+
+
+def _send_via_cowagent_channel(task: AlbumPushTask) -> str:
+    injected_sender = get_channel_sender()
+    if injected_sender:
+        return injected_sender(
+            {
+                "user_id": task.user_id,
+                "channel_type": task.push_channel,
+                "trace_id": task.push_task_id,
+                "message": task.push_payload_json,
+            }
+        )
     settings = get_settings()
     with httpx.Client(timeout=10) as client:
         response = client.post(
-            f"{settings.agent_base_url.rstrip('/')}/internal/channels/send-message",
+            f"{_channel_base_url().rstrip('/')}/internal/channels/send-message",
             json={
                 "user_id": task.user_id,
                 "channel_type": task.push_channel,
@@ -659,10 +695,16 @@ def push_results(db: Session, limit: int = 20) -> dict:
         generation = db.scalar(select(AlbumGenerationTask).where(AlbumGenerationTask.generation_task_id == task.generation_task_id))
         result = db.scalar(select(AlbumGenerationResult).where(AlbumGenerationResult.result_id == task.result_id))
         try:
-            if get_settings().agent_base_url and not get_settings().mock_push:
-                message_id = _send_via_agent(task)
+            if task.message_id:
+                message_id = task.message_id
+            elif _has_push_channel() and not get_settings().mock_push:
+                message_id = _send_via_cowagent_channel(task)
+                task.message_id = message_id
+                db.commit()
             else:
                 message_id = _id("msg")
+                task.message_id = message_id
+                db.commit()
             if generation and not get_settings().mock_account and get_settings().account_server_base_url:
                 with httpx.Client(timeout=10) as client:
                     client.post(
