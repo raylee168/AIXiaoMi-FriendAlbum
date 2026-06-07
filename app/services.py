@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -205,6 +206,91 @@ def _eligible_photos(db: Session, user_id: str, now: datetime) -> list[PhotoFile
     )
 
 
+def _summary_for_photos(db: Session, photos: list[PhotoFile]) -> dict:
+    results = list(
+        db.scalars(
+            select(PhotoPreprocessResult).where(
+                PhotoPreprocessResult.photo_id.in_([photo.photo_id for photo in photos])
+            )
+        )
+    )
+    avg_quality = float(sum(float(result.quality_score) for result in results) / len(results)) if results else 0.0
+    return {
+        "photo_count": len(photos),
+        "usable_photo_count": len(photos),
+        "photo_ids": [photo.photo_id for photo in photos],
+        "scene_summary": sorted({tag for result in results for tag in (result.scene_tags_json or [])}),
+        "quality_summary": {"avg_quality_score": round(avg_quality, 4)},
+        "people_summary": {
+            "has_people_count": sum(1 for result in results if result.has_person),
+            "face_count_avg": round(sum(result.face_count for result in results) / len(results), 2) if results else 0,
+        },
+    }
+
+
+def _local_decision(summary: dict) -> dict:
+    return {
+        "content": {
+            "decision": "should_generate",
+            "reason": "Mock 判断：可用照片数量达标，适合生成朋友圈相册。",
+            "confidence": 0.86,
+            "selected_photo_ids": summary["photo_ids"][:9],
+            "keep_photo_ids": summary["photo_ids"][9:],
+            "reject_photo_ids": [],
+            "reject_reasons": {},
+            "template_matches": [{"template_id": "mvp_grid_001", "score": 0.9}],
+        },
+        "cost": {"charged_tokens": 1200},
+        "usage": {"total_tokens": 1500},
+        "model": "mock-local-decision",
+    }
+
+
+def _llm_decision(summary: dict, user_id: str, decision_job_id: str) -> dict:
+    settings = get_settings()
+    if settings.mock_llm or not settings.llm_proxy_base_url:
+        return _local_decision(summary)
+    try:
+        with httpx.Client(timeout=20) as client:
+            response = client.post(
+                f"{settings.llm_proxy_base_url}/v1/chat/completions",
+                json={
+                    "model_type": "text_llm",
+                    "purpose": "moments_album_decision",
+                    "user_id": user_id,
+                    "business_scenario": "moments_album",
+                    "session_id": decision_job_id,
+                    "request_id": f"decision_{decision_job_id}",
+                    "messages": [
+                        {"role": "system", "content": "你是朋友圈相册智能决策助手。请严格输出 JSON。"},
+                        {"role": "user", "content": json.dumps(summary, ensure_ascii=False)},
+                    ],
+                    "response_format": "json",
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("error"):
+                raise RuntimeError(payload["error"]["code"])
+            return payload
+    except Exception:
+        return {
+            "content": {
+                "decision": "wait_more_photos",
+                "reason": "LLMProxy 调用失败，暂不生成。",
+                "confidence": 0,
+                "selected_photo_ids": [],
+                "keep_photo_ids": summary["photo_ids"],
+                "reject_photo_ids": [],
+                "reject_reasons": {},
+                "template_matches": [],
+            },
+            "cost": {"charged_tokens": 0},
+            "usage": {"total_tokens": 0},
+            "model": "llm-proxy-fallback",
+        }
+
+
 def make_decisions(db: Session) -> dict:
     started = datetime.utcnow()
     settings = get_settings()
@@ -230,16 +316,14 @@ def make_decisions(db: Session) -> dict:
         )
         if existing:
             continue
-        summary = {
-            "photo_count": len(photos),
-            "usable_photo_count": len(photos),
-            "scene_summary": ["daily", "life"],
-            "quality_summary": {"avg_quality_score": 0.8},
-            "people_summary": {"has_people_count": 0, "face_count_avg": 0},
-        }
+        summary = _summary_for_photos(db, photos)
         decision_job_id = _id("decision")
-        selected_ids = [photo.photo_id for photo in photos[: min(9, len(photos))]]
-        templates = [{"template_id": "mvp_grid_001", "score": 0.9}]
+        llm_payload = _llm_decision(summary, user_id, decision_job_id)
+        decision_content = llm_payload["content"]
+        selected_ids = decision_content.get("selected_photo_ids") or [photo.photo_id for photo in photos[: min(9, len(photos))]]
+        templates = decision_content.get("template_matches") or [{"template_id": "mvp_grid_001", "score": 0.9}]
+        decision_result = decision_content.get("decision", "wait_more_photos")
+        decision_tokens = int((llm_payload.get("cost") or {}).get("charged_tokens") or 0)
         job = AlbumDecisionJob(
             decision_job_id=decision_job_id,
             user_id=user_id,
@@ -248,26 +332,36 @@ def make_decisions(db: Session) -> dict:
             photo_count=len(photos),
             usable_photo_count=len(photos),
             summary_json=summary,
-            decision_result="should_generate",
-            decision_reason="Mock 判断：可用照片数量达标，适合生成朋友圈相册。",
-            confidence=0.86,
+            decision_result=decision_result,
+            decision_reason=decision_content.get("reason"),
+            confidence=float(decision_content.get("confidence") or 0),
             template_matches_json=templates,
             suggested_album_count=settings.default_album_count,
-            created_generation_count=settings.default_album_count,
+            created_generation_count=settings.default_album_count if decision_result == "should_generate" else 0,
             processed_at=now,
         )
         db.add(job)
+        reject_reasons = decision_content.get("reject_reasons") or {}
+        reject_ids = set(decision_content.get("reject_photo_ids") or [])
         for idx, photo in enumerate(photos):
+            role = "reject" if photo.photo_id in reject_ids else ("selected" if photo.photo_id in selected_ids else "keep")
             db.add(
                 AlbumDecisionJobPhoto(
                     decision_job_id=decision_job_id,
                     photo_id=photo.photo_id,
                     user_id=user_id,
-                    photo_role="selected" if photo.photo_id in selected_ids else "keep",
+                    photo_role=role,
+                    reject_reason=reject_reasons.get(photo.photo_id),
                     is_main_candidate=1 if idx == 0 else 0,
                     score=0.9 if idx == 0 else 0.75,
                 )
             )
+            if role == "reject":
+                photo.smart_reject_count += 1
+                photo.smart_reject_status = "rejected_final" if photo.smart_reject_count >= 2 else "rejected_once"
+        if decision_result != "should_generate":
+            processed += 1
+            continue
         for album_index in range(1, settings.default_album_count + 1):
             task_id = _id("gen")
             task = AlbumGenerationTask(
@@ -278,6 +372,14 @@ def make_decisions(db: Session) -> dict:
                 album_index=album_index,
                 photo_ids_json=selected_ids,
                 main_photo_id=selected_ids[0],
+                generation_params_json={
+                    "decision_cost": {
+                        "charged_tokens": decision_tokens if album_index == 1 else 0,
+                        "provider": llm_payload.get("provider") or ("llm-proxy" if not settings.mock_llm and settings.llm_proxy_base_url else "mock"),
+                        "model_name": llm_payload.get("model"),
+                        "usage": llm_payload.get("usage") or {},
+                    }
+                },
                 estimated_token_cost=220000,
                 max_frozen_tokens=settings.single_task_freeze_limit,
             )
@@ -323,7 +425,7 @@ def _freeze_account(task: AlbumGenerationTask) -> tuple[str, int, bool]:
         return payload["hold_id"], payload["frozen_tokens"], not summary.get("has_recharged", False)
 
 
-def _copywriting() -> dict:
+def _fallback_copywriting() -> dict:
     return {
         "title": "把今天装进相册里",
         "copy_options": [
@@ -334,7 +436,53 @@ def _copywriting() -> dict:
     }
 
 
-def _render_album(task: AlbumGenerationTask, photos: list[PhotoFile]) -> tuple[str, str, dict, int, int, int]:
+def _copywriting(task: AlbumGenerationTask, photos: list[PhotoFile]) -> tuple[dict, dict]:
+    fallback = _fallback_copywriting()
+    settings = get_settings()
+    if settings.mock_llm or not settings.llm_proxy_base_url:
+        return fallback, {"charged_tokens": 12000, "provider": "mock", "model_name": "mock-local-copy", "usage": {}}
+    try:
+        with httpx.Client(timeout=20) as client:
+            response = client.post(
+                f"{settings.llm_proxy_base_url}/v1/chat/completions",
+                json={
+                    "model_type": "text_llm",
+                    "purpose": "moments_album_copywriting",
+                    "user_id": task.user_id,
+                    "business_scenario": "ai_secretary_moments_copywriting",
+                    "session_id": task.generation_task_id,
+                    "request_id": f"copy_{task.generation_task_id}",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                {
+                                    "generation_task_id": task.generation_task_id,
+                                    "photo_ids": [photo.photo_id for photo in photos],
+                                    "copy_style": task.copy_style,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        }
+                    ],
+                    "response_format": "json",
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("error"):
+                raise RuntimeError(payload["error"]["code"])
+            return payload["content"], {
+                "charged_tokens": (payload.get("cost") or {}).get("charged_tokens", 12000),
+                "provider": payload.get("provider") or "llm-proxy",
+                "model_name": payload.get("model"),
+                "usage": payload.get("usage") or {},
+            }
+    except Exception:
+        return fallback, {"charged_tokens": 12000, "provider": "fallback", "model_name": "fallback-copy", "usage": {}}
+
+
+def _render_album(task: AlbumGenerationTask, photos: list[PhotoFile]) -> tuple[str, str, dict, dict, int, int, int]:
     result_dir = Path(get_settings().storage_root) / "results" / task.generation_task_id
     result_dir.mkdir(parents=True, exist_ok=True)
     image_path = result_dir / f"album_{task.album_index:03d}.jpg"
@@ -350,7 +498,7 @@ def _render_album(task: AlbumGenerationTask, photos: list[PhotoFile]) -> tuple[s
             x = x0 + (idx % 3) * (cell_w + 15)
             y = y0 + (idx // 3) * (cell_h + 15)
             canvas.paste(img, (x, y))
-    copy = _copywriting()
+    copy, copy_cost = _copywriting(task, photos)
     draw.text((48, 40), copy["title"], fill="#252525")
     draw.text((48, 780), copy["copy_options"][0]["text"], fill="#252525")
     if task.has_watermark:
@@ -359,7 +507,7 @@ def _render_album(task: AlbumGenerationTask, photos: list[PhotoFile]) -> tuple[s
     thumb = canvas.copy()
     thumb.thumbnail((320, 320))
     thumb.save(thumb_path, format="JPEG", quality=82)
-    return str(image_path), str(thumb_path), copy, canvas.width, canvas.height, image_path.stat().st_size
+    return str(image_path), str(thumb_path), copy, copy_cost, canvas.width, canvas.height, image_path.stat().st_size
 
 
 def generate_albums(db: Session, limit: int = 10) -> dict:
@@ -383,8 +531,11 @@ def generate_albums(db: Session, limit: int = 10) -> dict:
             task.frozen_token_amount = frozen_tokens
             task.has_watermark = int(has_watermark)
             photos = list(db.scalars(select(PhotoFile).where(PhotoFile.photo_id.in_(task.photo_ids_json))))
-            image_path, thumb_path, copy, width, height, file_size = _render_album(task, photos)
-            actual_cost = 12000 + 60000 + get_settings().platform_service_fee_tokens
+            image_path, thumb_path, copy, copy_cost, width, height, file_size = _render_album(task, photos)
+            decision_cost = (task.generation_params_json or {}).get("decision_cost") or {}
+            decision_tokens = int(decision_cost.get("charged_tokens") or 0)
+            copy_tokens = int(copy_cost.get("charged_tokens", 12000))
+            actual_cost = decision_tokens + copy_tokens + 60000 + get_settings().platform_service_fee_tokens
             task.actual_token_cost = actual_cost
             task.result_dir = str(Path(image_path).parent)
             task.result_album_path = image_path
@@ -410,19 +561,22 @@ def generate_albums(db: Session, limit: int = 10) -> dict:
             )
             db.add(result)
             for cost_type, name, tokens in [
-                ("text_llm_copywriting", "朋友圈文案生成", 12000),
+                ("text_llm_decision", "智能生成判断", decision_tokens),
+                ("text_llm_copywriting", "朋友圈文案生成", copy_tokens),
                 ("image_rendering", "相册渲染与图片处理", 60000),
                 ("platform_service_fee", "平台服务费", get_settings().platform_service_fee_tokens),
             ]:
+                is_copy = cost_type == "text_llm_copywriting"
+                is_decision = cost_type == "text_llm_decision"
                 db.add(
                     AlbumCostItem(
                         generation_task_id=task.generation_task_id,
                         user_id=task.user_id,
                         cost_type=cost_type,
                         cost_name=name,
-                        provider="mock",
-                        model_name="mock-v1",
-                        usage_json={},
+                        provider=copy_cost.get("provider", "mock") if is_copy else decision_cost.get("provider", "mock") if is_decision else "mock",
+                        model_name=copy_cost.get("model_name", "mock-v1") if is_copy else decision_cost.get("model_name", "mock-v1") if is_decision else "mock-v1",
+                        usage_json=copy_cost.get("usage", {}) if is_copy else decision_cost.get("usage", {}) if is_decision else {},
                         actual_cost_yuan=0,
                         charged_tokens=tokens,
                         visible_to_user=1,
