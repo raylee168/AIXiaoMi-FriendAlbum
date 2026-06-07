@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import httpx
 from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageStat
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -524,8 +524,21 @@ def generate_albums(db: Session, limit: int = 10) -> dict:
     failed = 0
     for task in tasks:
         try:
-            task.status = "processing"
-            task.started_at = datetime.utcnow()
+            started_at = datetime.utcnow()
+            claimed = db.execute(
+                update(AlbumGenerationTask)
+                .where(
+                    AlbumGenerationTask.generation_task_id == task.generation_task_id,
+                    AlbumGenerationTask.status == "pending",
+                )
+                .values(status="processing", started_at=started_at)
+            ).rowcount
+            db.commit()
+            if not claimed:
+                continue
+            task = db.scalar(
+                select(AlbumGenerationTask).where(AlbumGenerationTask.generation_task_id == task.generation_task_id)
+            )
             hold_id, frozen_tokens, has_watermark = _freeze_account(task)
             task.account_hold_id = hold_id
             task.frozen_token_amount = frozen_tokens
@@ -632,40 +645,55 @@ def push_results(db: Session, limit: int = 20) -> dict:
         db.scalars(select(AlbumPushTask).where(AlbumPushTask.status == "pending").order_by(AlbumPushTask.created_at).limit(limit))
     )
     processed = 0
+    failed = 0
     for task in tasks:
+        claimed = db.execute(
+            update(AlbumPushTask)
+            .where(AlbumPushTask.push_task_id == task.push_task_id, AlbumPushTask.status == "pending")
+            .values(status="processing")
+        ).rowcount
+        db.commit()
+        if not claimed:
+            continue
+        task = db.scalar(select(AlbumPushTask).where(AlbumPushTask.push_task_id == task.push_task_id))
         generation = db.scalar(select(AlbumGenerationTask).where(AlbumGenerationTask.generation_task_id == task.generation_task_id))
         result = db.scalar(select(AlbumGenerationResult).where(AlbumGenerationResult.result_id == task.result_id))
-        if get_settings().agent_base_url and not get_settings().mock_push:
-            message_id = _send_via_agent(task)
-        else:
-            message_id = _id("msg")
-        task.status = "success"
-        task.message_id = message_id
-        task.pushed_at = datetime.utcnow()
-        if generation and not get_settings().mock_account and get_settings().account_server_base_url:
-            with httpx.Client(timeout=10) as client:
-                client.post(
-                    f"{get_settings().account_server_base_url}/internal/billing/token-holds/{generation.account_hold_id}/settle",
-                    json={"actual_consumed_tokens": generation.actual_token_cost, "cost_items": []},
-                ).raise_for_status()
-        cleanup_paths = []
-        if result:
-            cleanup_paths.extend([result.image_path, result.thumbnail_path])
-        if generation and generation.result_dir:
-            cleanup_paths.append(generation.result_dir)
-        db.add(
-            AlbumCleanupTask(
-                cleanup_task_id=_id("cleanup"),
-                user_id=task.user_id,
-                generation_task_id=task.generation_task_id,
-                cleanup_scope_json={"paths": cleanup_paths},
-                expire_at=result.expire_at if result else datetime.utcnow() + timedelta(hours=3),
+        try:
+            if get_settings().agent_base_url and not get_settings().mock_push:
+                message_id = _send_via_agent(task)
+            else:
+                message_id = _id("msg")
+            if generation and not get_settings().mock_account and get_settings().account_server_base_url:
+                with httpx.Client(timeout=10) as client:
+                    client.post(
+                        f"{get_settings().account_server_base_url}/internal/billing/token-holds/{generation.account_hold_id}/settle",
+                        json={"actual_consumed_tokens": generation.actual_token_cost, "cost_items": []},
+                    ).raise_for_status()
+            task.status = "success"
+            task.message_id = message_id
+            task.pushed_at = datetime.utcnow()
+            cleanup_paths = []
+            if result:
+                cleanup_paths.extend([result.image_path, result.thumbnail_path])
+            if generation and generation.result_dir:
+                cleanup_paths.append(generation.result_dir)
+            db.add(
+                AlbumCleanupTask(
+                    cleanup_task_id=_id("cleanup"),
+                    user_id=task.user_id,
+                    generation_task_id=task.generation_task_id,
+                    cleanup_scope_json={"paths": cleanup_paths},
+                    expire_at=result.expire_at if result else datetime.utcnow() + timedelta(hours=3),
+                )
             )
-        )
-        processed += 1
+            processed += 1
+        except Exception as exc:
+            task.status = "failed"
+            task.error_message = str(exc)
+            failed += 1
     db.commit()
-    _log(db, "album_push", started, len(tasks), processed, 0)
-    return {"scanned": len(tasks), "processed": processed, "failed": 0}
+    _log(db, "album_push", started, len(tasks), processed, failed)
+    return {"scanned": len(tasks), "processed": processed, "failed": failed}
 
 
 def cleanup_files(db: Session, limit: int = 50) -> dict:
