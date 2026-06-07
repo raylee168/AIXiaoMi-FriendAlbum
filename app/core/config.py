@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     database_url: str = "mysql+pymysql://root@127.0.0.1:3306/core_album_db?charset=utf8mb4"
     account_server_base_url: str = ""
     llm_proxy_base_url: str = ""
+    agent_base_url: str = ""
     storage_root: str = "/data/smart-album"
     mock_account: bool = True
     mock_llm: bool = True

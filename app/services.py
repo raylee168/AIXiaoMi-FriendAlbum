@@ -609,6 +609,23 @@ def generate_albums(db: Session, limit: int = 10) -> dict:
     return {"scanned": len(tasks), "processed": processed, "failed": failed}
 
 
+def _send_via_agent(task: AlbumPushTask) -> str:
+    settings = get_settings()
+    with httpx.Client(timeout=10) as client:
+        response = client.post(
+            f"{settings.agent_base_url.rstrip('/')}/internal/channels/send-message",
+            json={
+                "user_id": task.user_id,
+                "channel_type": task.push_channel,
+                "trace_id": task.push_task_id,
+                "message": task.push_payload_json,
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload["message_id"]
+
+
 def push_results(db: Session, limit: int = 20) -> dict:
     started = datetime.utcnow()
     tasks = list(
@@ -618,8 +635,12 @@ def push_results(db: Session, limit: int = 20) -> dict:
     for task in tasks:
         generation = db.scalar(select(AlbumGenerationTask).where(AlbumGenerationTask.generation_task_id == task.generation_task_id))
         result = db.scalar(select(AlbumGenerationResult).where(AlbumGenerationResult.result_id == task.result_id))
+        if get_settings().agent_base_url and not get_settings().mock_push:
+            message_id = _send_via_agent(task)
+        else:
+            message_id = _id("msg")
         task.status = "success"
-        task.message_id = _id("msg")
+        task.message_id = message_id
         task.pushed_at = datetime.utcnow()
         if generation and not get_settings().mock_account and get_settings().account_server_base_url:
             with httpx.Client(timeout=10) as client:

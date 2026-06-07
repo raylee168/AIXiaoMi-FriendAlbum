@@ -16,7 +16,8 @@ from sqlalchemy import select
 from app.db.base import Base
 from app.db.session import SessionLocal, engine
 from app.main import app
-from app.models import AlbumCleanupTask, AlbumGenerationResult, AlbumPushTask, PhotoFile, PluginEvent
+from app.core.config import get_settings
+from app.models import AlbumCleanupTask, AlbumGenerationResult, AlbumGenerationTask, AlbumPushTask, PhotoFile, PluginEvent
 
 
 Base.metadata.create_all(bind=engine)
@@ -150,3 +151,69 @@ def test_photo_reject_updates_only_specified_photos():
     assert photos["reject_photo_1"].smart_reject_status == "rejected_final"
     assert photos["reject_photo_2"].smart_reject_count == 0
     db.close()
+
+
+def test_push_uses_agent_message_id(monkeypatch):
+    monkeypatch.setenv("AGENT_BASE_URL", "http://agent.local")
+    monkeypatch.setenv("MOCK_PUSH", "false")
+    get_settings.cache_clear()
+
+    db = SessionLocal()
+    task_id = "gen_agent_push"
+    result_id = "result_agent_push"
+    now = datetime.utcnow()
+    db.add(
+        AlbumGenerationTask(
+            generation_task_id=task_id,
+            user_id="u_agent",
+            decision_job_id="decision_agent",
+            template_id="mvp_grid_001",
+            album_index=1,
+            photo_ids_json=["p_agent"],
+            main_photo_id="p_agent",
+            status="success",
+            result_dir=str(Path(storage_root) / "results" / task_id),
+            actual_token_cost=12000,
+        )
+    )
+    db.add(
+        AlbumGenerationResult(
+            result_id=result_id,
+            generation_task_id=task_id,
+            user_id="u_agent",
+            album_title="title",
+            copy_text="copy",
+            copy_options_json=[{"style": "daily", "text": "copy"}],
+            image_path=str(Path(storage_root) / "agent.jpg"),
+            thumbnail_path=str(Path(storage_root) / "agent_thumb.jpg"),
+            width=1,
+            height=1,
+            file_size=1,
+            expire_at=now + timedelta(hours=3),
+        )
+    )
+    db.add(
+        AlbumPushTask(
+            push_task_id="push_agent",
+            user_id="u_agent",
+            generation_task_id=task_id,
+            result_id=result_id,
+            push_channel="mock",
+            push_payload_json={"type": "album_result", "text": "copy"},
+            status="pending",
+        )
+    )
+    db.commit()
+    db.close()
+
+    monkeypatch.setattr("app.services._send_via_agent", lambda task: "agent_msg_001")
+    response = client.post("/internal/schedulers/push")
+    assert response.status_code == 200
+
+    db = SessionLocal()
+    pushed = db.query(AlbumPushTask).filter(AlbumPushTask.push_task_id == "push_agent").one()
+    assert pushed.status == "success"
+    assert pushed.message_id == "agent_msg_001"
+    db.close()
+    monkeypatch.setenv("MOCK_PUSH", "true")
+    get_settings.cache_clear()
