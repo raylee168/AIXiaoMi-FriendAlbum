@@ -112,7 +112,7 @@ class MomentsAlbum(Plugin):
             if not manager:
                 return None
             if channel_type:
-                return manager.get_channel(channel_type)
+                return manager.get_channel(channel_type) or manager.channel
             return manager.channel
         except Exception as exc:
             logger.warning(f"[moments_album] CowAgent channel unavailable: {exc}")

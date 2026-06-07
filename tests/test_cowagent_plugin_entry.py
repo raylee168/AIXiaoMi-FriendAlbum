@@ -119,3 +119,32 @@ def test_cowagent_plugin_reuses_main_channel(monkeypatch):
 
     assert message_id.startswith("cowagent_msg_")
     assert sent == [("IMAGE", "/tmp/a.jpg", "user_1"), ("TEXT", "done", "user_1")]
+
+
+def test_cowagent_plugin_falls_back_to_primary_channel(monkeypatch):
+    sent = []
+
+    class Channel:
+        def send(self, reply, context):
+            sent.append((reply.type, reply.content, context.kwargs["receiver"]))
+
+    class Manager:
+        channel = Channel()
+
+        def get_channel(self, channel_type):
+            return None
+
+    monkeypatch.setattr(__main__, "get_channel_manager", lambda: Manager(), raising=False)
+    module = importlib.import_module("cowagent_plugin")
+    plugin = module.MomentsAlbum()
+
+    message_id = plugin._send_message(
+        {
+            "user_id": "user_2",
+            "channel_type": "mock",
+            "message": {"text": "fallback"},
+        }
+    )
+
+    assert message_id.startswith("cowagent_msg_")
+    assert sent == [("TEXT", "fallback", "user_2")]
