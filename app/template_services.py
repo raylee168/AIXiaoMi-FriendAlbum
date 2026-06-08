@@ -122,6 +122,8 @@ def list_templates(db: Session, status: str | None = None, category: str | None 
     stmt = select(AlbumTemplate)
     if status:
         stmt = stmt.where(AlbumTemplate.status == status)
+    else:
+        stmt = stmt.where(AlbumTemplate.status != "archived")
     if category:
         stmt = stmt.where(AlbumTemplate.category == category)
     if q:
