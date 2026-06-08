@@ -19,7 +19,7 @@ from app.db.session import SessionLocal, engine
 from app.main import app
 from app.core.config import get_settings
 from app.channel_bridge import set_channel_sender
-from app.models import AlbumCleanupTask, AlbumGenerationResult, AlbumGenerationTask, AlbumPushTask, PhotoFile, PluginEvent
+from app.models import AlbumCleanupTask, AlbumGenerationResult, AlbumGenerationTask, AlbumPushTask, AlbumTemplate, PhotoFile, PluginEvent
 
 
 Base.metadata.create_all(bind=engine)
@@ -132,6 +132,109 @@ def test_photo_reject_updates_only_specified_photos():
             )
         )
     db.commit()
+    db.close()
+
+
+def test_template_generation_publish_and_match():
+    response = client.post(
+        "/internal/templates/generate-seasonal",
+        json={
+            "festival": "端午节",
+            "target_count": 8,
+            "photo_count_min": 1,
+            "photo_count_max": 12,
+            "style_direction": "朋友圈、清新、节日氛围",
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["created"] == 8
+
+    templates = client.get("/internal/templates").json()["items"]
+    assert len(templates) >= 8
+    first = templates[0]
+    assert first["preview_asset"]["data_url"].startswith("data:image/jpeg;base64,")
+    assert set(first["version"]["template_json"]).issuperset({"layout", "matching_rules", "llm_prompt", "render_instructions"})
+
+    published = client.post(f"/internal/templates/{first['template_id']}/publish")
+    assert published.status_code == 200
+    assert published.json()["status"] == "published"
+
+    match = client.post(
+        "/internal/templates/match-test",
+        json={"photo_count": 9, "scene_tags": ["端午节", "美食", "朋友圈"], "limit": 3},
+    )
+    assert match.status_code == 200
+    matches = match.json()["matches"]
+    assert matches
+    assert matches[0]["template_id"] == first["template_id"] or matches[0]["score"] > 0
+
+
+def test_published_template_is_used_by_generation_flow():
+    db = SessionLocal()
+    any_published = db.scalar(select(AlbumTemplate).where(AlbumTemplate.status == "published"))
+    db.close()
+    if not any_published:
+        generated = client.post("/internal/templates/generate-seasonal", json={"festival": "端午节", "target_count": 1}).json()
+        client.post(f"/internal/templates/{generated['template_ids'][0]}/publish")
+
+    db = SessionLocal()
+    now = datetime.utcnow()
+    base = Path(storage_root) / "uploads" / "u_template" / "batch_template"
+    for folder in ["original", "compressed", "thumbnails"]:
+        (base / folder).mkdir(parents=True, exist_ok=True)
+    photo_ids = []
+    for idx in range(6):
+        photo_id = f"tpl_photo_{idx:03d}"
+        photo_ids.append(photo_id)
+        original = base / "original" / f"{photo_id}.jpg"
+        compressed = base / "compressed" / f"{photo_id}.jpg"
+        thumb = base / "thumbnails" / f"{photo_id}.jpg"
+        img = Image.new("RGB", (900, 700), (110, 150 + idx * 10, 120))
+        img.save(original)
+        img.resize((600, 467)).save(compressed)
+        img.resize((240, 186)).save(thumb)
+        db.add(
+            PhotoFile(
+                photo_id=photo_id,
+                user_id="u_template",
+                upload_batch_id="batch_template",
+                original_path=str(original),
+                compressed_path=str(compressed),
+                thumbnail_path=str(thumb),
+                original_filename=f"{photo_id}.jpg",
+                mime_type="image/jpeg",
+                file_size=original.stat().st_size,
+                width=900,
+                height=700,
+                uploaded_at=now,
+                expire_at=now + timedelta(hours=3),
+                preprocess_status="pending",
+                cleanup_status="pending",
+            )
+        )
+    db.add(
+        PluginEvent(
+            event_id="evt_batch_template",
+            event_type="photo_uploaded",
+            user_id="u_template",
+            source_server="photo-upload-server",
+            payload_json={"upload_batch_id": "batch_template", "photo_ids": photo_ids},
+            status="pending",
+            retry_count=0,
+            max_retry=3,
+            next_run_at=now,
+        )
+    )
+    db.commit()
+    db.close()
+    response = client.post("/internal/schedulers/run-all")
+    assert response.status_code == 200
+
+    db = SessionLocal()
+    tasks = list(db.scalars(select(AlbumGenerationTask).where(AlbumGenerationTask.user_id == "u_template").order_by(AlbumGenerationTask.created_at.desc())))
+    assert tasks
+    assert any(task.template_id != "mvp_grid_001" for task in tasks)
     db.close()
 
     first = client.post(

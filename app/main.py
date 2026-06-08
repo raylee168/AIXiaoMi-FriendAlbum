@@ -1,9 +1,9 @@
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.schemas import PhotoRejectApply
+from app.schemas import AlbumTemplateCreate, AlbumTemplateMatchTest, AlbumTemplateSeasonalGenerate, AlbumTemplateUpdate, PhotoRejectApply
 from app.services import (
     apply_photo_rejects,
     cleanup_files,
@@ -13,6 +13,17 @@ from app.services import (
     push_results,
     run_all,
     scan_events,
+)
+from app.template_services import (
+    archive_template,
+    create_template,
+    generate_seasonal_templates,
+    generate_template_preview,
+    get_template,
+    list_templates,
+    match_templates,
+    publish_template,
+    update_template,
 )
 
 app = FastAPI(title="AIXiaoMi Friend Album", version="0.1.0")
@@ -62,3 +73,66 @@ def post_apply_rejects(payload: PhotoRejectApply, db: Session = Depends(get_db))
 @app.post("/internal/schedulers/run-all")
 def post_run_all(db: Session = Depends(get_db)) -> dict:
     return run_all(db)
+
+
+@app.get("/internal/templates")
+def get_templates(status: str | None = None, category: str | None = None, q: str | None = None, db: Session = Depends(get_db)) -> dict:
+    return list_templates(db, status=status, category=category, q=q)
+
+
+@app.post("/internal/templates")
+def post_template(payload: AlbumTemplateCreate, db: Session = Depends(get_db)) -> dict:
+    try:
+        return create_template(db, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/internal/templates/{template_id}")
+def get_template_detail(template_id: str, db: Session = Depends(get_db)) -> dict:
+    try:
+        return get_template(db, template_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.put("/internal/templates/{template_id}")
+def put_template(template_id: str, payload: AlbumTemplateUpdate, db: Session = Depends(get_db)) -> dict:
+    try:
+        return update_template(db, template_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/internal/templates/{template_id}/publish")
+def post_template_publish(template_id: str, db: Session = Depends(get_db)) -> dict:
+    try:
+        return publish_template(db, template_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/internal/templates/{template_id}/archive")
+def post_template_archive(template_id: str, db: Session = Depends(get_db)) -> dict:
+    try:
+        return archive_template(db, template_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/internal/templates/{template_id}/preview")
+def post_template_preview(template_id: str, db: Session = Depends(get_db)) -> dict:
+    try:
+        return generate_template_preview(db, template_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/internal/templates/generate-seasonal")
+def post_templates_generate_seasonal(payload: AlbumTemplateSeasonalGenerate, db: Session = Depends(get_db)) -> dict:
+    return generate_seasonal_templates(db, payload)
+
+
+@app.post("/internal/templates/match-test")
+def post_template_match_test(payload: AlbumTemplateMatchTest, db: Session = Depends(get_db)) -> dict:
+    return match_templates(db, payload)

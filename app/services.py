@@ -25,6 +25,7 @@ from app.models import (
     SchedulerRunLog,
 )
 from app.schemas import PhotoRejectApply
+from app.template_services import choose_templates_for_summary, get_template_definition, render_album_with_template
 
 
 def _id(prefix: str) -> str:
@@ -338,7 +339,9 @@ def make_decisions(db: Session) -> dict:
         llm_payload = _llm_decision(summary, user_id, decision_job_id)
         decision_content = llm_payload["content"]
         selected_ids = decision_content.get("selected_photo_ids") or [photo.photo_id for photo in photos[: min(9, len(photos))]]
-        templates = decision_content.get("template_matches") or [{"template_id": "mvp_grid_001", "score": 0.9}]
+        templates = choose_templates_for_summary(db, summary, settings.default_album_count)
+        if not templates:
+            templates = decision_content.get("template_matches") or [{"template_id": "mvp_grid_001", "version": "v1", "score": 0.9}]
         decision_result = decision_content.get("decision", "wait_more_photos")
         decision_tokens = int((llm_payload.get("cost") or {}).get("charged_tokens") or 0)
         job = AlbumDecisionJob(
@@ -381,15 +384,18 @@ def make_decisions(db: Session) -> dict:
             continue
         for album_index in range(1, settings.default_album_count + 1):
             task_id = _id("gen")
+            matched_template = templates[(album_index - 1) % len(templates)]
             task = AlbumGenerationTask(
                 generation_task_id=task_id,
                 user_id=user_id,
                 decision_job_id=decision_job_id,
-                template_id="mvp_grid_001",
+                template_id=matched_template.get("template_id", "mvp_grid_001"),
+                template_version=matched_template.get("version", "v1"),
                 album_index=album_index,
                 photo_ids_json=selected_ids,
                 main_photo_id=selected_ids[0],
                 generation_params_json={
+                    "template_match": matched_template,
                     "decision_cost": {
                         "charged_tokens": decision_tokens if album_index == 1 else 0,
                         "provider": llm_payload.get("provider") or ("llm-proxy" if not settings.mock_llm and settings.llm_proxy_base_url else "mock"),
@@ -499,27 +505,30 @@ def _copywriting(task: AlbumGenerationTask, photos: list[PhotoFile]) -> tuple[di
         return fallback, {"charged_tokens": 12000, "provider": "fallback", "model_name": "fallback-copy", "usage": {}}
 
 
-def _render_album(task: AlbumGenerationTask, photos: list[PhotoFile]) -> tuple[str, str, dict, dict, int, int, int]:
+def _render_album(db: Session, task: AlbumGenerationTask, photos: list[PhotoFile]) -> tuple[str, str, dict, dict, int, int, int]:
     result_dir = Path(get_settings().storage_root) / "results" / task.generation_task_id
     result_dir.mkdir(parents=True, exist_ok=True)
     image_path = result_dir / f"album_{task.album_index:03d}.jpg"
     thumb_path = result_dir / f"album_{task.album_index:03d}_thumb.jpg"
-    canvas = Image.new("RGB", (1080, 1080), "#f7f7f2")
-    draw = ImageDraw.Draw(canvas)
-    selected = photos[:6]
-    cell_w, cell_h = 330, 300
-    x0, y0 = 45, 120
-    for idx, photo in enumerate(selected):
-        with Image.open(photo.thumbnail_path if Path(photo.thumbnail_path).exists() else photo.original_path) as img:
-            img = ImageOps.fit(img.convert("RGB"), (cell_w, cell_h))
-            x = x0 + (idx % 3) * (cell_w + 15)
-            y = y0 + (idx // 3) * (cell_h + 15)
-            canvas.paste(img, (x, y))
     copy, copy_cost = _copywriting(task, photos)
-    draw.text((48, 40), copy["title"], fill="#252525")
-    draw.text((48, 780), copy["copy_options"][0]["text"], fill="#252525")
-    if task.has_watermark:
-        draw.text((770, 1020), "AIXiaoMi Smart Album", fill="#666666")
+    template_json = get_template_definition(db, task.template_id, task.template_version)
+    canvas = render_album_with_template(task, photos, template_json)
+    if canvas is None:
+        canvas = Image.new("RGB", (1080, 1080), "#f7f7f2")
+        draw = ImageDraw.Draw(canvas)
+        selected = photos[:6]
+        cell_w, cell_h = 330, 300
+        x0, y0 = 45, 120
+        for idx, photo in enumerate(selected):
+            with Image.open(photo.thumbnail_path if Path(photo.thumbnail_path).exists() else photo.original_path) as img:
+                img = ImageOps.fit(img.convert("RGB"), (cell_w, cell_h))
+                x = x0 + (idx % 3) * (cell_w + 15)
+                y = y0 + (idx // 3) * (cell_h + 15)
+                canvas.paste(img, (x, y))
+        draw.text((48, 40), copy["title"], fill="#252525")
+        draw.text((48, 780), copy["copy_options"][0]["text"], fill="#252525")
+        if task.has_watermark:
+            draw.text((770, 1020), "AIXiaoMi Smart Album", fill="#666666")
     canvas.save(image_path, format="JPEG", quality=90)
     thumb = canvas.copy()
     thumb.thumbnail((320, 320))
@@ -561,7 +570,7 @@ def generate_albums(db: Session, limit: int = 10) -> dict:
             task.frozen_token_amount = frozen_tokens
             task.has_watermark = int(has_watermark)
             photos = list(db.scalars(select(PhotoFile).where(PhotoFile.photo_id.in_(task.photo_ids_json))))
-            image_path, thumb_path, copy, copy_cost, width, height, file_size = _render_album(task, photos)
+            image_path, thumb_path, copy, copy_cost, width, height, file_size = _render_album(db, task, photos)
             decision_cost = (task.generation_params_json or {}).get("decision_cost") or {}
             decision_tokens = int(decision_cost.get("charged_tokens") or 0)
             copy_tokens = int(copy_cost.get("charged_tokens", 12000))

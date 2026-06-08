@@ -164,6 +164,72 @@ class AlbumGenerationTask(Base, TimestampMixin):
     error_message: Mapped[str | None] = mapped_column(Text)
 
 
+class AlbumTemplate(Base, TimestampMixin):
+    __tablename__ = "album_templates"
+
+    id: Mapped[int] = mapped_column(IdType, primary_key=True, autoincrement=True)
+    template_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    category: Mapped[str] = mapped_column(String(64), default="daily", index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="draft", index=True, nullable=False)
+    min_photo_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    max_photo_count: Mapped[int] = mapped_column(Integer, default=9, nullable=False)
+    theme_tags_json: Mapped[list | None] = mapped_column(JSON)
+    style_tags_json: Mapped[list | None] = mapped_column(JSON)
+    sort_order: Mapped[int] = mapped_column(Integer, default=1000, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    current_version: Mapped[str] = mapped_column(String(32), default="v1", nullable=False)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class AlbumTemplateVersion(Base, TimestampMixin):
+    __tablename__ = "album_template_versions"
+    __table_args__ = (UniqueConstraint("template_id", "version", name="uq_album_template_version"),)
+
+    id: Mapped[int] = mapped_column(IdType, primary_key=True, autoincrement=True)
+    template_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    version: Mapped[str] = mapped_column(String(32), default="v1", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="draft", index=True, nullable=False)
+    template_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    llm_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    matching_rules_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    render_params_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_by: Mapped[str] = mapped_column(String(64), default="system", nullable=False)
+
+
+class AlbumTemplateAsset(Base, TimestampMixin):
+    __tablename__ = "album_template_assets"
+
+    id: Mapped[int] = mapped_column(IdType, primary_key=True, autoincrement=True)
+    asset_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    template_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    version: Mapped[str] = mapped_column(String(32), default="v1", nullable=False)
+    asset_type: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    file_path: Mapped[str | None] = mapped_column(String(1024))
+    mime_type: Mapped[str] = mapped_column(String(64), default="image/jpeg", nullable=False)
+    width: Mapped[int | None] = mapped_column(Integer)
+    height: Mapped[int | None] = mapped_column(Integer)
+    summary_json: Mapped[dict | None] = mapped_column(JSON)
+
+
+class AlbumTemplateGenerationJob(Base, TimestampMixin):
+    __tablename__ = "album_template_generation_jobs"
+
+    id: Mapped[int] = mapped_column(IdType, primary_key=True, autoincrement=True)
+    generation_job_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    festival: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    photo_count_min: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    photo_count_max: Mapped[int] = mapped_column(Integer, default=9, nullable=False)
+    style_direction: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(32), default="success", index=True, nullable=False)
+    template_ids_json: Mapped[list | None] = mapped_column(JSON)
+    request_json: Mapped[dict | None] = mapped_column(JSON)
+    result_json: Mapped[dict | None] = mapped_column(JSON)
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+
 class AlbumGenerationTaskPhoto(Base):
     __tablename__ = "album_generation_task_photos"
 
