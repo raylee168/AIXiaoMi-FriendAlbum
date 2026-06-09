@@ -170,6 +170,38 @@ def test_template_generation_publish_and_match():
     assert matches[0]["template_id"] == first["template_id"] or matches[0]["score"] > 0
 
 
+def test_template_factory_dialog_generates_draft_user_templates():
+    base = client.get("/internal/templates/base")
+    assert base.status_code == 200
+    base_items = base.json()["items"]
+    assert any(item["base_template_id"] == "base_grid_1" for item in base_items)
+    assert any(item["base_template_id"] == "base_portrait_overflow" for item in base_items)
+
+    prompt = (
+        "我要制作一个用户仅需要1-6张照片，就能生成创意相册的模板，"
+        "你以端午节为主题，基于现有的基础模板，制作20个用户模板，"
+        "生成一些端午节祝福的图片，预先填充基础模板，预留几张空白9宫格位置，填充用户上传的图片"
+    )
+    response = client.post("/internal/templates/factory/generate", json={"prompt": prompt})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["created"] == 20
+    assert payload["plan"]["theme"] == "端午节"
+    assert payload["plan"]["photo_count_min"] == 1
+    assert payload["plan"]["photo_count_max"] == 6
+
+    created = client.get("/internal/templates", params={"category": "factory"}).json()["items"]
+    generated = [item for item in created if item["template_id"] in payload["template_ids"]]
+    assert len(generated) == 20
+    assert all(item["status"] == "draft" for item in generated)
+    assert any(item["version"]["template_json"].get("base_template_id") == "base_portrait_overflow" for item in generated)
+    assert any(
+        slot.get("source") == "generated"
+        for item in generated
+        for slot in item["version"]["template_json"]["layout"]["slots"]
+    )
+
+
 def test_published_template_is_used_by_generation_flow():
     db = SessionLocal()
     any_published = db.scalar(select(AlbumTemplate).where(AlbumTemplate.status == "published"))

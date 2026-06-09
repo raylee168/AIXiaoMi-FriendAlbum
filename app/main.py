@@ -3,7 +3,14 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.schemas import AlbumTemplateCreate, AlbumTemplateMatchTest, AlbumTemplateSeasonalGenerate, AlbumTemplateUpdate, PhotoRejectApply
+from app.schemas import (
+    AlbumTemplateCreate,
+    AlbumTemplateFactoryGenerate,
+    AlbumTemplateMatchTest,
+    AlbumTemplateSeasonalGenerate,
+    AlbumTemplateUpdate,
+    PhotoRejectApply,
+)
 from app.services import (
     apply_photo_rejects,
     cleanup_files,
@@ -17,9 +24,11 @@ from app.services import (
 from app.template_services import (
     archive_template,
     create_template,
+    generate_templates_from_dialog,
     generate_seasonal_templates,
     generate_template_preview,
     get_template,
+    list_base_templates,
     list_templates,
     match_templates,
     publish_template,
@@ -80,6 +89,11 @@ def get_templates(status: str | None = None, category: str | None = None, q: str
     return list_templates(db, status=status, category=category, q=q)
 
 
+@app.get("/internal/templates/base")
+def get_base_templates() -> dict:
+    return list_base_templates()
+
+
 @app.post("/internal/templates")
 def post_template(payload: AlbumTemplateCreate, db: Session = Depends(get_db)) -> dict:
     try:
@@ -131,6 +145,11 @@ def post_template_preview(template_id: str, db: Session = Depends(get_db)) -> di
 @app.post("/internal/templates/generate-seasonal")
 def post_templates_generate_seasonal(payload: AlbumTemplateSeasonalGenerate, db: Session = Depends(get_db)) -> dict:
     return generate_seasonal_templates(db, payload)
+
+
+@app.post("/internal/templates/factory/generate")
+def post_templates_factory_generate(payload: AlbumTemplateFactoryGenerate, db: Session = Depends(get_db)) -> dict:
+    return generate_templates_from_dialog(db, payload)
 
 
 @app.post("/internal/templates/match-test")

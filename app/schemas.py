@@ -44,6 +44,15 @@ class AlbumTemplateSeasonalGenerate(BaseModel):
     created_by: str = "admin"
 
 
+class AlbumTemplateFactoryGenerate(BaseModel):
+    prompt: str
+    target_count: int | None = None
+    photo_count_min: int | None = None
+    photo_count_max: int | None = None
+    theme: str | None = None
+    created_by: str = "admin"
+
+
 class AlbumTemplateMatchTest(BaseModel):
     upload_batch_id: str | None = None
     user_id: str | None = None

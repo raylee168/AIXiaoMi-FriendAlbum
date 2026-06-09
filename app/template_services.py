@@ -1,5 +1,6 @@
 import base64
 import json
+import re
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -19,9 +20,113 @@ from app.models import (
     PhotoPreprocessResult,
 )
 from app.schemas import AlbumTemplateCreate, AlbumTemplateMatchTest, AlbumTemplateSeasonalGenerate, AlbumTemplateUpdate
+from app.schemas import AlbumTemplateFactoryGenerate
 
 
 REQUIRED_TEMPLATE_KEYS = {"layout", "matching_rules", "llm_prompt", "render_instructions"}
+
+
+BASE_TEMPLATE_LIBRARY = [
+    {
+        "base_template_id": "base_grid_1",
+        "name": "1张图填充",
+        "photo_count_min": 1,
+        "photo_count_max": 1,
+        "family": "grid",
+        "description": "单张照片填满九宫格画布，适合高质量主图、封面感图片。",
+        "layout": {"type": "base_grid_1", "canvas_ratio": "1:1", "slots": [{"x": 0.06, "y": 0.14, "w": 0.88, "h": 0.72, "role": "main", "source": "user"}]},
+    },
+    {
+        "base_template_id": "base_grid_2",
+        "name": "2张图填充",
+        "photo_count_min": 2,
+        "photo_count_max": 2,
+        "family": "grid",
+        "description": "两张照片左右并排，适合对比、情侣、朋友、双主体场景。",
+        "layout": {"type": "base_grid_2", "canvas_ratio": "1:1", "slots": [{"x": 0.06, "y": 0.20, "w": 0.42, "h": 0.60, "source": "user"}, {"x": 0.52, "y": 0.20, "w": 0.42, "h": 0.60, "source": "user"}]},
+    },
+    {
+        "base_template_id": "base_grid_3",
+        "name": "3张图填充",
+        "photo_count_min": 3,
+        "photo_count_max": 3,
+        "family": "grid",
+        "description": "一张主图加两张辅助图，适合旅行、美食、聚会的重点叙事。",
+        "layout": {"type": "base_grid_3", "canvas_ratio": "1:1", "slots": [{"x": 0.06, "y": 0.16, "w": 0.58, "h": 0.68, "role": "main", "source": "user"}, {"x": 0.68, "y": 0.16, "w": 0.26, "h": 0.31, "source": "user"}, {"x": 0.68, "y": 0.53, "w": 0.26, "h": 0.31, "source": "user"}]},
+    },
+    {
+        "base_template_id": "base_grid_4",
+        "name": "4张图填充",
+        "photo_count_min": 4,
+        "photo_count_max": 4,
+        "family": "grid",
+        "description": "标准四宫格，适合整齐、干净、主题统一的照片组。",
+        "layout": {"type": "base_grid_4", "canvas_ratio": "1:1", "slots": [{"x": 0.06 + (i % 2) * 0.45, "y": 0.14 + (i // 2) * 0.38, "w": 0.42, "h": 0.34, "source": "user"} for i in range(4)]},
+    },
+    {
+        "base_template_id": "base_grid_5",
+        "name": "5张图填充",
+        "photo_count_min": 5,
+        "photo_count_max": 5,
+        "family": "grid",
+        "description": "一张主图带四张辅助图，适合有明确主角的生活碎片。",
+        "layout": {"type": "base_grid_5", "canvas_ratio": "1:1", "slots": [{"x": 0.06, "y": 0.16, "w": 0.54, "h": 0.54, "role": "main", "source": "user"}] + [{"x": 0.64 + (i % 2) * 0.15, "y": 0.16 + (i // 2) * 0.28, "w": 0.13, "h": 0.24, "source": "user"} for i in range(4)]},
+    },
+    {
+        "base_template_id": "base_grid_6",
+        "name": "6张图填充",
+        "photo_count_min": 6,
+        "photo_count_max": 6,
+        "family": "grid",
+        "description": "2行3列均衡网格，适合朋友圈常规多图展示。",
+        "layout": {"type": "base_grid_6", "canvas_ratio": "1:1", "slots": [{"x": 0.06 + (i % 3) * 0.30, "y": 0.18 + (i // 3) * 0.32, "w": 0.28, "h": 0.28, "source": "user"} for i in range(6)]},
+    },
+    {
+        "base_template_id": "base_grid_7",
+        "name": "7张图填充",
+        "photo_count_min": 7,
+        "photo_count_max": 7,
+        "family": "grid",
+        "description": "一张横向主图加六张小图，适合游记、活动回顾。",
+        "layout": {"type": "base_grid_7", "canvas_ratio": "1:1", "slots": [{"x": 0.06, "y": 0.12, "w": 0.88, "h": 0.30, "role": "main", "source": "user"}] + [{"x": 0.06 + (i % 3) * 0.30, "y": 0.48 + (i // 3) * 0.22, "w": 0.28, "h": 0.20, "source": "user"} for i in range(6)]},
+    },
+    {
+        "base_template_id": "base_grid_8",
+        "name": "8张图填充",
+        "photo_count_min": 8,
+        "photo_count_max": 8,
+        "family": "grid",
+        "description": "预留一个主题位的九宫格，适合节日祝福图加用户照片。",
+        "layout": {"type": "base_grid_8", "canvas_ratio": "1:1", "slots": [{"x": 0.06 + (i % 3) * 0.30, "y": 0.15 + (i // 3) * 0.25, "w": 0.28, "h": 0.22, "source": "generated" if i == 4 else "user"} for i in range(9)]},
+    },
+    {
+        "base_template_id": "base_grid_9",
+        "name": "9张图填充",
+        "photo_count_min": 9,
+        "photo_count_max": 9,
+        "family": "grid",
+        "description": "完整九宫格，适合照片数量充足、视觉整齐的朋友圈相册。",
+        "layout": {"type": "base_grid_9", "canvas_ratio": "1:1", "slots": [{"x": 0.06 + (i % 3) * 0.30, "y": 0.15 + (i // 3) * 0.25, "w": 0.28, "h": 0.22, "source": "user"} for i in range(9)]},
+    },
+    {
+        "base_template_id": "base_portrait_overflow",
+        "name": "人像主图放大越界",
+        "photo_count_min": 1,
+        "photo_count_max": 6,
+        "family": "creative",
+        "description": "人像主图放大并越出九宫格边界，后方保留小图和祝福位，适合封面感、人物感强的相册。",
+        "layout": {"type": "base_portrait_overflow", "canvas_ratio": "1:1", "slots": [{"x": 0.42, "y": -0.03, "w": 0.56, "h": 0.82, "role": "main", "source": "user", "overflow": True}, {"x": 0.07, "y": 0.24, "w": 0.28, "h": 0.22, "source": "user"}, {"x": 0.07, "y": 0.50, "w": 0.28, "h": 0.22, "source": "generated"}, {"x": 0.07, "y": 0.76, "w": 0.28, "h": 0.18, "source": "empty"}]},
+    },
+    {
+        "base_template_id": "base_blessing_mix",
+        "name": "照片祝福混排",
+        "photo_count_min": 1,
+        "photo_count_max": 6,
+        "family": "festival",
+        "description": "用户照片、节日祝福图、空白留白混排，适合少量照片生成丰富节日相册。",
+        "layout": {"type": "base_blessing_mix", "canvas_ratio": "1:1", "slots": [{"x": 0.06 + (i % 3) * 0.30, "y": 0.15 + (i // 3) * 0.25, "w": 0.28, "h": 0.22, "source": "user" if i in [0, 2, 3, 5, 6, 8] else ("generated" if i in [1, 4] else "empty")} for i in range(9)]},
+    },
+]
 
 
 def _id(prefix: str) -> str:
@@ -131,6 +236,10 @@ def list_templates(db: Session, status: str | None = None, category: str | None 
         stmt = stmt.where(AlbumTemplate.name.like(like))
     templates = list(db.scalars(stmt.order_by(AlbumTemplate.sort_order, AlbumTemplate.created_at.desc())))
     return {"items": [_template_payload(db, template, include_preview=True) for template in templates]}
+
+
+def list_base_templates() -> dict:
+    return {"items": BASE_TEMPLATE_LIBRARY}
 
 
 def get_template(db: Session, template_id: str) -> dict:
@@ -297,10 +406,7 @@ def render_template_preview_image(template_json: dict, title: str = "") -> Image
         y = int(slot.get("y", 0) * height)
         w = int(slot.get("w", 0.2) * width)
         h = int(slot.get("h", 0.2) * height)
-        color = _slot_color(idx)
-        draw.rounded_rectangle((x, y, x + w, y + h), radius=18, fill=color, outline="white", width=border)
-        label = "主图" if slot.get("role") == "main" else str(idx + 1)
-        draw.text((x + 14, y + 12), label, fill="#263238")
+        _draw_slot_preview(draw, (x, y, x + w, y + h), slot, idx, border, template_json)
     text_areas = render.get("text_areas") or []
     for area in text_areas:
         x = int(area.get("x", 0.05) * width)
@@ -309,6 +415,33 @@ def render_template_preview_image(template_json: dict, title: str = "") -> Image
     for deco in render.get("decorations") or []:
         draw.text((int(deco.get("x", 0.85) * width), int(deco.get("y", 0.08) * height)), deco.get("text", "*"), fill=accent)
     return canvas
+
+
+def _draw_slot_preview(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int], slot: dict, idx: int, border: int, template_json: dict) -> None:
+    source = slot.get("source", "user")
+    if source == "generated":
+        _draw_generated_card(draw, box, template_json, idx)
+        return
+    if source == "empty":
+        draw.rounded_rectangle(box, radius=18, fill="#ffffff", outline="#d7eadc", width=max(2, border // 2))
+        draw.text((box[0] + 12, box[1] + 12), "留白", fill="#86a58f")
+        return
+    color = _slot_color(idx)
+    draw.rounded_rectangle(box, radius=18, fill=color, outline="white", width=border)
+    label = "主图" if slot.get("role") == "main" else f"用户图{idx + 1}"
+    draw.text((box[0] + 14, box[1] + 12), label, fill="#263238")
+
+
+def _draw_generated_card(draw: ImageDraw.ImageDraw, box: tuple[int, int, int, int], template_json: dict, idx: int) -> None:
+    render = template_json.get("render_instructions") or {}
+    theme = render.get("theme") or "端午节"
+    blessings = render.get("blessing_texts") or ["端午安康", "粽有好运", "夏日清欢", "平安喜乐"]
+    text = blessings[idx % len(blessings)]
+    accent = render.get("accent_color") or "#16a34a"
+    draw.rounded_rectangle(box, radius=18, fill="#fff7ed", outline="#ffffff", width=6)
+    draw.text((box[0] + 14, box[1] + 12), theme, fill=accent)
+    draw.text((box[0] + 14, box[1] + max(34, (box[3] + box[1]) // 2 - 12)), text, fill="#92400e")
+    draw.text((box[2] - 52, box[3] - 30), "AI图", fill="#c2410c")
 
 
 def _canvas_size(ratio: str) -> tuple[int, int]:
@@ -360,6 +493,197 @@ def generate_seasonal_templates(db: Session, payload: AlbumTemplateSeasonalGener
     job.result_json = {"created": len(template_ids)}
     db.commit()
     return {"generation_job_id": job.generation_job_id, "created": len(template_ids), "template_ids": template_ids}
+
+
+def generate_templates_from_dialog(db: Session, payload: AlbumTemplateFactoryGenerate) -> dict:
+    plan = _plan_from_dialog(payload)
+    job = AlbumTemplateGenerationJob(
+        generation_job_id=_id("tpljob"),
+        festival=plan["theme"],
+        target_count=plan["target_count"],
+        photo_count_min=plan["photo_count_min"],
+        photo_count_max=plan["photo_count_max"],
+        style_direction=plan["style_direction"],
+        status="success",
+        request_json=payload.model_dump(),
+        template_ids_json=[],
+        result_json={"plan": plan, "base_template_ids": [item["base_template_id"] for item in plan["base_templates"]]},
+    )
+    db.add(job)
+    template_ids = []
+    for seed in _dialog_template_seeds(plan):
+        created = create_template(db, AlbumTemplateCreate(**seed, created_by=payload.created_by))
+        template_ids.append(created["template_id"])
+    job.template_ids_json = template_ids
+    job.result_json = {**(job.result_json or {}), "created": len(template_ids)}
+    db.commit()
+    return {
+        "generation_job_id": job.generation_job_id,
+        "created": len(template_ids),
+        "template_ids": template_ids,
+        "plan": plan,
+    }
+
+
+def _plan_from_dialog(payload: AlbumTemplateFactoryGenerate) -> dict:
+    prompt = payload.prompt.strip()
+    photo_min, photo_max = _extract_photo_range(prompt)
+    target_count = payload.target_count or _extract_target_count(prompt) or 8
+    theme = payload.theme or _extract_theme(prompt) or "端午节"
+    photo_min = payload.photo_count_min or photo_min or 1
+    photo_max = payload.photo_count_max or photo_max or 6
+    photo_min = max(1, min(photo_min, 9))
+    photo_max = max(photo_min, min(photo_max, 9))
+    target_count = max(1, min(target_count, 20))
+    base_templates = _select_base_templates(photo_min, photo_max, target_count, prompt)
+    return {
+        "prompt": prompt,
+        "theme": theme,
+        "target_count": target_count,
+        "photo_count_min": photo_min,
+        "photo_count_max": photo_max,
+        "style_direction": _extract_style_direction(prompt),
+        "base_templates": base_templates,
+        "strategy": "local_rule_planner_ready_for_llm",
+    }
+
+
+def _extract_target_count(prompt: str) -> int | None:
+    match = re.search(r"(\d+)\s*个", prompt)
+    return int(match.group(1)) if match else None
+
+
+def _extract_photo_range(prompt: str) -> tuple[int | None, int | None]:
+    match = re.search(r"(\d+)\s*[-到至]\s*(\d+)\s*张", prompt)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+    match = re.search(r"(\d+)\s*张", prompt)
+    if match:
+        value = int(match.group(1))
+        return value, value
+    return None, None
+
+
+def _extract_theme(prompt: str) -> str | None:
+    match = re.search(r"以(.{1,12}?)(?:为主题|主题)", prompt)
+    if match:
+        return match.group(1).strip(" ，。,.")
+    if "端午" in prompt:
+        return "端午节"
+    return None
+
+
+def _extract_style_direction(prompt: str) -> str:
+    hints = []
+    for word in ["创意", "清新", "国风", "手账", "祝福", "朋友圈", "高级", "可爱", "美食", "亲子", "旅行"]:
+        if word in prompt:
+            hints.append(word)
+    return "、".join(hints or ["朋友圈", "创意", "节日氛围"])
+
+
+def _select_base_templates(photo_min: int, photo_max: int, target_count: int, prompt: str) -> list[dict]:
+    candidates = [
+        item for item in BASE_TEMPLATE_LIBRARY
+        if item["photo_count_min"] <= photo_max and item["photo_count_max"] >= photo_min
+    ]
+    if "人像" in prompt or "主图" in prompt or "越出" in prompt:
+        candidates.sort(key=lambda item: 0 if item["base_template_id"] == "base_portrait_overflow" else 1)
+    if not candidates:
+        candidates = BASE_TEMPLATE_LIBRARY[:]
+    return [candidates[idx % len(candidates)] for idx in range(target_count)]
+
+
+def _dialog_template_seeds(plan: dict) -> list[dict]:
+    seeds = []
+    styles = ["粽香祝福", "清新艾草", "国风留白", "手账拼贴", "夏日小聚", "朋友圈封面", "亲子温暖", "旅行随拍"]
+    for idx, base in enumerate(plan["base_templates"]):
+        style = styles[idx % len(styles)]
+        name = f"{plan['theme']}{style}{idx + 1:02d}"
+        min_count = max(plan["photo_count_min"], base["photo_count_min"])
+        max_count = min(plan["photo_count_max"], base["photo_count_max"])
+        if min_count > max_count:
+            min_count, max_count = plan["photo_count_min"], plan["photo_count_max"]
+        template_json = _user_template_from_base(base, plan, idx, name)
+        matching_rules = {
+            "theme_tags": [plan["theme"], "朋友圈", "节日", style],
+            "style_tags": [style, plan["style_direction"]],
+            "min_photo_count": min_count,
+            "max_photo_count": max_count,
+            "preferred_scenes": [plan["theme"], "美食", "亲子", "朋友", "旅行", "人像"],
+            "mood": ["warm", "fresh", "happy"],
+            "base_template_id": base["base_template_id"],
+        }
+        llm_prompt = (
+            f"这是由底层模板“{base['name']}”预加工出的用户模板。"
+            f"主题是{plan['theme']}，用户只需要上传{min_count}-{max_count}张照片。"
+            "source=user 的槽位填用户照片，source=generated 的槽位使用系统预生成祝福图，source=empty 保持留白。"
+            "选图优先清晰、有节日氛围、主体明确的照片；人像主图模板优先选择半身或全身人像。"
+        )
+        seeds.append(
+            {
+                "name": name,
+                "category": "factory",
+                "min_photo_count": min_count,
+                "max_photo_count": max_count,
+                "theme_tags": [plan["theme"], "朋友圈", "节日", style],
+                "style_tags": [style, "对话生成", base["family"]],
+                "description": f"基于“{base['name']}”生成：{base['description']}",
+                "template_json": template_json,
+                "llm_prompt": llm_prompt,
+                "matching_rules": matching_rules,
+                "render_params": template_json["render_instructions"],
+            }
+        )
+    return seeds
+
+
+def _user_template_from_base(base: dict, plan: dict, idx: int, name: str) -> dict:
+    layout = json.loads(json.dumps(base["layout"]))
+    slots = layout.get("slots") or []
+    user_budget = min(plan["photo_count_max"], sum(1 for slot in slots if slot.get("source", "user") == "user"))
+    used_user = 0
+    for slot_idx, slot in enumerate(slots):
+        if slot.get("source", "user") == "user":
+            used_user += 1
+            if used_user > user_budget:
+                slot["source"] = "empty"
+        slot.setdefault("slot_id", f"s{slot_idx + 1}")
+    blessings = _theme_blessings(plan["theme"], idx)
+    return {
+        "base_template_id": base["base_template_id"],
+        "layout": layout,
+        "matching_rules": {},
+        "llm_prompt": "",
+        "render_instructions": {
+            "theme": plan["theme"],
+            "background": _theme_background(idx),
+            "accent_color": _theme_accent(idx),
+            "border_width": 8,
+            "blessing_texts": blessings,
+            "decorations": [{"text": plan["theme"], "x": 0.82, "y": 0.06}],
+            "text_areas": [{"x": 0.06, "y": 0.04, "text": name}],
+            "watermark_area": {"x": 0.72, "y": 0.94, "w": 0.24, "h": 0.04},
+        },
+    }
+
+
+def _theme_blessings(theme: str, idx: int) -> list[str]:
+    if "端午" in theme:
+        groups = [
+            ["端午安康", "粽有好运", "仲夏清欢"],
+            ["一口香粽", "万事顺意", "平安喜乐"],
+            ["艾草清香", "好运常在", "岁岁安康"],
+        ]
+        return groups[idx % len(groups)]
+    return [f"{theme}快乐", "平安喜乐", "好事发生"]
+
+
+def _theme_background(idx: int) -> str:
+    return ["#f8fff4", "#fff7ed", "#f0fdfa", "#f8fafc", "#fff1f2"][idx % 5]
+
+
+def _theme_accent(idx: int) -> str:
+    return ["#16a34a", "#b45309", "#0f766e", "#334155", "#be123c"][idx % 5]
 
 
 def _seasonal_seeds(festival: str, photo_min: int, photo_max: int, style_direction: str) -> list[dict]:
@@ -567,16 +891,26 @@ def render_album_with_template(task, photos: list[PhotoFile], template_json: dic
     canvas = Image.new("RGB", (width, height), render.get("background") or "#f7f7f2")
     draw = ImageDraw.Draw(canvas)
     slots = layout.get("slots") or []
+    user_idx = 0
     for idx, slot in enumerate(slots):
-        if idx >= len(photos):
-            break
-        photo = photos[idx]
+        source = slot.get("source", "user")
+        x = int(slot.get("x", 0) * width)
+        y = int(slot.get("y", 0) * height)
+        w = int(slot.get("w", 0.2) * width)
+        h = int(slot.get("h", 0.2) * height)
+        if source == "generated":
+            _draw_generated_card(draw, (x, y, x + w, y + h), template_json, idx)
+            continue
+        if source == "empty":
+            draw.rounded_rectangle((x, y, x + w, y + h), radius=16, fill="#ffffff", outline="#d7eadc", width=4)
+            continue
+        if user_idx >= len(photos):
+            draw.rounded_rectangle((x, y, x + w, y + h), radius=16, fill="#f8fafc", outline="#e2e8f0", width=4)
+            continue
+        photo = photos[user_idx]
+        user_idx += 1
         image_path = photo.thumbnail_path if Path(photo.thumbnail_path).exists() else photo.original_path
         with Image.open(image_path) as img:
-            x = int(slot.get("x", 0) * width)
-            y = int(slot.get("y", 0) * height)
-            w = int(slot.get("w", 0.2) * width)
-            h = int(slot.get("h", 0.2) * height)
             fitted = ImageOps.fit(img.convert("RGB"), (w, h))
             canvas.paste(fitted, (x, y))
             draw.rounded_rectangle((x, y, x + w, y + h), radius=16, outline="white", width=int(render.get("border_width", 8)))
