@@ -5,11 +5,13 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.schemas import (
     AlbumTemplateCreate,
+    ExecutableTemplateCreate,
     AlbumTemplateFactoryGenerate,
     AlbumTemplateMatchTest,
     AlbumTemplateSeasonalGenerate,
     AlbumTemplateUpdate,
     PhotoRejectApply,
+    TemplateBaseImageGenerate,
 )
 from app.services import (
     apply_photo_rejects,
@@ -23,7 +25,9 @@ from app.services import (
 )
 from app.template_services import (
     archive_template,
+    create_executable_template,
     create_template,
+    generate_template_base_image_asset,
     generate_templates_from_dialog,
     generate_seasonal_templates,
     generate_template_preview,
@@ -98,6 +102,22 @@ def get_base_templates() -> dict:
 def post_template(payload: AlbumTemplateCreate, db: Session = Depends(get_db)) -> dict:
     try:
         return create_template(db, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/internal/templates/base-image/generate")
+def post_template_base_image_generate(payload: TemplateBaseImageGenerate) -> dict:
+    try:
+        return generate_template_base_image_asset(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/internal/templates/executable")
+def post_executable_template(payload: ExecutableTemplateCreate, db: Session = Depends(get_db)) -> dict:
+    try:
+        return create_executable_template(db, payload)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

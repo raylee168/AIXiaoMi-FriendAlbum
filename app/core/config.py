@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     platform_service_fee_tokens: int = 50_000
     result_expire_hours: int = 3
     scheduler_worker_id: str = "friend-album-local"
+    agnes_image_base_url: str = "https://apihub.agnes-ai.com/v1/images/generations"
+    agnes_image_api_key: str = ""
+    agnes_image_model: str = "agnes-image-2.1-flash"
+    mock_image_generation: bool = True
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

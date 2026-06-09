@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.image_generation import generate_template_base_image
 from app.models import (
     AlbumTemplate,
     AlbumTemplateAsset,
@@ -20,7 +21,8 @@ from app.models import (
     PhotoPreprocessResult,
 )
 from app.schemas import AlbumTemplateCreate, AlbumTemplateMatchTest, AlbumTemplateSeasonalGenerate, AlbumTemplateUpdate
-from app.schemas import AlbumTemplateFactoryGenerate
+from app.schemas import AlbumTemplateFactoryGenerate, ExecutableTemplateCreate, TemplateBaseImageGenerate
+from app.template_engine import render_template_image
 
 
 REQUIRED_TEMPLATE_KEYS = {"layout", "matching_rules", "llm_prompt", "render_instructions"}
@@ -146,6 +148,11 @@ def _validate_template_json(template_json: dict) -> None:
     layout = template_json.get("layout") or {}
     if not layout.get("type"):
         raise ValueError("template_layout_type_required")
+    if template_json.get("template_type") == "subject_cutout":
+        placement = (template_json.get("render_instructions") or {}).get("subject_placement")
+        if not placement:
+            raise ValueError("subject_placement_required")
+        return
     slots = layout.get("slots") or []
     if not isinstance(slots, list) or not slots:
         raise ValueError("template_layout_slots_required")
@@ -391,7 +398,139 @@ def generate_template_preview(db: Session, template_id: str) -> dict:
     return get_template(db, template_id)
 
 
+def generate_template_base_image_asset(payload: TemplateBaseImageGenerate) -> dict:
+    image, metadata = generate_template_base_image(
+        template_type=payload.template_type,
+        user_prompt=payload.prompt,
+        size=payload.size,
+        slot_summary=payload.slot_summary,
+    )
+    asset_id = _id("baseimg")
+    path = Path(get_settings().storage_root) / "templates" / "_generated_base_images"
+    path.mkdir(parents=True, exist_ok=True)
+    file_path = path / f"{asset_id}.jpg"
+    image.save(file_path, format="JPEG", quality=90)
+    return {
+        "asset_id": asset_id,
+        "file_path": str(file_path),
+        "width": image.width,
+        "height": image.height,
+        "mime_type": "image/jpeg",
+        "metadata": metadata,
+        "data_url": _data_url(str(file_path), "image/jpeg"),
+    }
+
+
+def create_executable_template(db: Session, payload: ExecutableTemplateCreate) -> dict:
+    template_type = payload.template_type
+    if template_type not in {"grid_fill", "subject_cutout"}:
+        raise ValueError("unsupported_template_type")
+    base = generate_template_base_image_asset(
+        TemplateBaseImageGenerate(
+            template_type=template_type,
+            prompt=payload.prompt,
+            size=payload.size,
+            slot_summary=_slot_summary_for_type(template_type, payload.min_photo_count, payload.max_photo_count),
+        )
+    )
+    template_json = _executable_template_json(payload, base["file_path"])
+    created = create_template(
+        db,
+        AlbumTemplateCreate(
+            name=payload.name,
+            category=template_type,
+            min_photo_count=payload.min_photo_count,
+            max_photo_count=payload.max_photo_count,
+            theme_tags=payload.theme_tags,
+            style_tags=[template_type, *payload.style_tags],
+            description=payload.prompt,
+            template_json=template_json,
+            llm_prompt=template_json["llm_prompt"],
+            matching_rules=template_json["matching_rules"],
+            render_params=template_json["render_instructions"],
+            created_by=payload.created_by,
+        ),
+    )
+    return {**created, "base_image": base}
+
+
+def _slot_summary_for_type(template_type: str, min_photo_count: int, max_photo_count: int) -> str:
+    if template_type == "subject_cutout":
+        return "one user photo is processed as a cutout subject and placed above a fake nine-grid background"
+    return f"{min_photo_count}-{max_photo_count} user photos fill rectangular empty slots; fixed decorative areas remain unchanged"
+
+
+def _executable_template_json(payload: ExecutableTemplateCreate, base_image_path: str) -> dict:
+    if payload.template_type == "subject_cutout":
+        return {
+            "template_type": "subject_cutout",
+            "layout": {"type": "subject_cutout", "canvas_ratio": "1:1", "slots": []},
+            "matching_rules": {
+                "template_type": "subject_cutout",
+                "min_photo_count": 1,
+                "max_photo_count": 1,
+                "requires_subject": True,
+                "preferred_scenes": payload.theme_tags + ["人像", "自拍", "旅行"],
+            },
+            "llm_prompt": (
+                "这是主体悬浮型模板。适合用户只有1张照片，且照片里有清晰人物主体的任务。"
+                "Agent 应优先选择人物清晰、身体轮廓完整、背景不复杂的照片；如果没有人像，应降低匹配分或改用填充型模板。"
+            ),
+            "render_instructions": {
+                "base_image_path": base_image_path,
+                "draw_grid_lines": True,
+                "grid_line_width": 16,
+                "grid_line_color": "#ffffff",
+                "subject_placement": {"x": 0.34, "y": 0.06, "w": 0.44, "h": 0.86},
+                "accent_color": "#ffffff",
+                "text_areas": [{"x": 0.06, "y": 0.04, "text": payload.name}],
+            },
+        }
+    slots = _grid_fill_slots(payload.max_photo_count)
+    return {
+        "template_type": "grid_fill",
+        "layout": {"type": "grid_fill", "canvas_ratio": "1:1", "slots": slots},
+        "matching_rules": {
+            "template_type": "grid_fill",
+            "min_photo_count": payload.min_photo_count,
+            "max_photo_count": payload.max_photo_count,
+            "preferred_scenes": payload.theme_tags + ["生活", "美食", "朋友", "旅行"],
+        },
+        "llm_prompt": (
+            "这是九宫格填充型模板。适合用户上传多张照片后，将照片直接填入模板空白槽位。"
+            "Agent 应选择清晰、主题统一、色调接近的照片；槽位按从上到下、从左到右填充。"
+        ),
+        "render_instructions": {
+            "base_image_path": base_image_path,
+            "border_width": 8,
+            "accent_color": "#16a34a",
+            "blessing_texts": ["端午安康", "粽有好运", "平安喜乐"],
+            "text_areas": [{"x": 0.06, "y": 0.04, "text": payload.name}],
+        },
+    }
+
+
+def _grid_fill_slots(max_photo_count: int) -> list[dict]:
+    slots = []
+    user_positions = [0, 1, 2, 6, 7, 8] if max_photo_count <= 6 else list(range(min(max_photo_count, 9)))
+    for idx in range(9):
+        source = "user" if idx in user_positions[:max_photo_count] else ("generated" if idx in [3, 4, 5] else "empty")
+        slots.append(
+            {
+                "slot_id": f"s{idx + 1}",
+                "x": 0.06 + (idx % 3) * 0.30,
+                "y": 0.15 + (idx // 3) * 0.25,
+                "w": 0.28,
+                "h": 0.22,
+                "source": source,
+            }
+        )
+    return slots
+
+
 def render_template_preview_image(template_json: dict, title: str = "") -> Image.Image:
+    if template_json.get("template_type") in {"grid_fill", "subject_cutout"}:
+        return render_template_image(template_json, [], watermark=False)
     layout = template_json.get("layout") or {}
     render = template_json.get("render_instructions") or {}
     ratio = layout.get("canvas_ratio", "1:1")
@@ -885,6 +1024,12 @@ def get_template_definition(db: Session, template_id: str, version: str = "v1") 
 def render_album_with_template(task, photos: list[PhotoFile], template_json: dict | None) -> Image.Image:
     if not template_json:
         return None
+    if template_json.get("template_type") in {"grid_fill", "subject_cutout"}:
+        photo_paths = []
+        for photo in photos:
+            thumb = Path(photo.thumbnail_path)
+            photo_paths.append(str(thumb if thumb.exists() else Path(photo.original_path)))
+        return render_template_image(template_json, photo_paths, watermark=bool(task.has_watermark))
     layout = template_json.get("layout") or {}
     render = template_json.get("render_instructions") or {}
     width, height = _canvas_size(layout.get("canvas_ratio", "1:1"))

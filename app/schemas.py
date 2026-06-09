@@ -53,6 +53,25 @@ class AlbumTemplateFactoryGenerate(BaseModel):
     created_by: str = "admin"
 
 
+class TemplateBaseImageGenerate(BaseModel):
+    template_type: str = "grid_fill"
+    prompt: str
+    size: str = "1024x1024"
+    slot_summary: str = ""
+
+
+class ExecutableTemplateCreate(BaseModel):
+    template_type: str
+    name: str
+    prompt: str
+    min_photo_count: int = 1
+    max_photo_count: int = 6
+    theme_tags: list[str] = []
+    style_tags: list[str] = []
+    size: str = "1024x1024"
+    created_by: str = "admin"
+
+
 class AlbumTemplateMatchTest(BaseModel):
     upload_batch_id: str | None = None
     user_id: str | None = None

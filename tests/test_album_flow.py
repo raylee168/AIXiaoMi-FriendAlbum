@@ -19,7 +19,8 @@ from app.db.session import SessionLocal, engine
 from app.main import app
 from app.core.config import get_settings
 from app.channel_bridge import set_channel_sender
-from app.models import AlbumCleanupTask, AlbumGenerationResult, AlbumGenerationTask, AlbumPushTask, AlbumTemplate, PhotoFile, PluginEvent
+from app.models import AlbumCleanupTask, AlbumGenerationResult, AlbumGenerationTask, AlbumPushTask, AlbumTemplate, AlbumTemplateVersion, PhotoFile, PluginEvent
+from app.template_services import render_album_with_template
 
 
 Base.metadata.create_all(bind=engine)
@@ -200,6 +201,80 @@ def test_template_factory_dialog_generates_draft_user_templates():
         for item in generated
         for slot in item["version"]["template_json"]["layout"]["slots"]
     )
+
+
+def test_executable_template_types_create_and_render():
+    grid = client.post(
+        "/internal/templates/executable",
+        json={
+            "template_type": "grid_fill",
+            "name": "端午六图填充模板",
+            "prompt": "端午节清新九宫格，中间是固定祝福装饰，上下留出照片空位",
+            "min_photo_count": 1,
+            "max_photo_count": 6,
+            "theme_tags": ["端午节"],
+        },
+    )
+    assert grid.status_code == 200
+    grid_payload = grid.json()
+    assert grid_payload["version"]["template_json"]["template_type"] == "grid_fill"
+    assert grid_payload["preview_asset"]["data_url"].startswith("data:image/jpeg;base64,")
+
+    cutout = client.post(
+        "/internal/templates/executable",
+        json={
+            "template_type": "subject_cutout",
+            "name": "草地九宫格主体悬浮模板",
+            "prompt": "假的九宫格草地风景背景，适合把人物主体悬浮贴上去",
+            "min_photo_count": 1,
+            "max_photo_count": 1,
+            "theme_tags": ["人像", "旅行"],
+        },
+    )
+    assert cutout.status_code == 200
+    cutout_payload = cutout.json()
+    assert cutout_payload["version"]["template_json"]["template_type"] == "subject_cutout"
+
+    db = SessionLocal()
+    now = datetime.utcnow()
+    base = Path(storage_root) / "uploads" / "u_exec" / "batch_exec"
+    for folder in ["original", "compressed", "thumbnails"]:
+        (base / folder).mkdir(parents=True, exist_ok=True)
+    original = base / "original" / "exec_photo.jpg"
+    compressed = base / "compressed" / "exec_photo.jpg"
+    thumb = base / "thumbnails" / "exec_photo.jpg"
+    Image.new("RGB", (900, 1200), (160, 130, 110)).save(original)
+    Image.new("RGB", (600, 800), (160, 130, 110)).save(compressed)
+    Image.new("RGB", (240, 320), (160, 130, 110)).save(thumb)
+    db.add(
+        PhotoFile(
+            photo_id="exec_photo_001",
+            user_id="u_exec",
+            upload_batch_id="batch_exec",
+            original_path=str(original),
+            compressed_path=str(compressed),
+            thumbnail_path=str(thumb),
+            original_filename="exec_photo.jpg",
+            mime_type="image/jpeg",
+            file_size=original.stat().st_size,
+            width=900,
+            height=1200,
+            uploaded_at=now,
+            expire_at=now + timedelta(hours=3),
+            preprocess_status="success",
+            cleanup_status="pending",
+        )
+    )
+    db.commit()
+    photos = list(db.scalars(select(PhotoFile).where(PhotoFile.upload_batch_id == "batch_exec")))
+    version = db.scalar(select(AlbumTemplateVersion).where(AlbumTemplateVersion.template_id == cutout_payload["template_id"]))
+
+    class Task:
+        has_watermark = False
+
+    image = render_album_with_template(Task(), photos[:1], version.template_json)
+    assert image.size == (1080, 1080)
+    db.close()
 
 
 def test_published_template_is_used_by_generation_flow():
